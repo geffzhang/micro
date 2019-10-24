@@ -3,19 +3,13 @@ using Microsoft.AspNetCore.Mvc;
 using System;
 using System.Collections.Generic;
 using System.Threading.Tasks;
-using IdentityModel;
-using IdentityServer4;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Options;
 using Volo.Abp;
 using Volo.Abp.Account.Web.Areas.Account.Controllers.Models;
-using Volo.Abp.AspNetCore.MultiTenancy;
-using Volo.Abp.Configuration;
 using Volo.Abp.Identity;
 using Volo.Abp.Validation;
-//using Volo.Abp.IdentityModel;
 using Volo.Abp.MultiTenancy;
-using Volo.Abp.Application.Services;
 using Volo.Abp.AspNetCore.Mvc;
 using Volo.Abp.Users;
 using Volo.Abp.Authorization;
@@ -29,21 +23,26 @@ using Volo.Abp.PermissionManagement;
 using Newtonsoft.Json;
 using Microsoft.EntityFrameworkCore;
 using Volo.Abp.Uow;
-using Volo.Abp.Domain.Repositories.EntityFrameworkCore;
-using Volo.Abp.Identity.EntityFrameworkCore;
+using Base.IdentityServer;
+using Volo.Abp.AspNetCore.MultiTenancy;
+using Volo.Abp.IdentityModel;
+using IdentityModel;
+using System.Net.Http;
 
 namespace Base.Controllers
 {
 
-    public class RoleDto:IdentityRoleDto
+    public class RoleDto : IdentityRoleDto
     {
 
         public List<string> grantPermission = new List<string>();
     }
 
 
-    public class RolePerssionReq:EntityDto<Guid>
+    public class RolePerssionReq : EntityDto<Guid>
     {
+
+        public string Name { get; set; }
 
         public List<string> grantPermission
         {
@@ -55,24 +54,38 @@ namespace Base.Controllers
     /// <summary>
     /// 用户权限及角色
     /// </summary>
-    public class RoleAndPermissionByUser:RolePerssionReq
+    public class RoleAndPermissionByUser : RolePerssionReq
     {
         public string[] grantRoles
         {
-            get;set;
+            get; set;
         }
     }
 
 
-    public class UserRole:IdentityUserRole
+    public class UserRole : IdentityUserRole
     {
-        public UserRole(Guid UserId,Guid RoleId)
+        public UserRole(Guid UserId, Guid RoleId)
         {
             this.UserId = UserId;
             this.RoleId = RoleId;
         }
     }
+    public class UpdateOrCreateUserDto : EntityDto<Guid>
+    {
 
+        public string Email { get; set; }
+
+        public string PhoneNumber { get; set; }
+
+        public string UserName { get; set; }
+
+        public string Password { get; set; }
+
+        public string[] Roles { get; set; }
+
+        public string[] Permissions { get; set; }
+    }
 
 
 
@@ -80,11 +93,13 @@ namespace Base.Controllers
     [Route("/api/[controller]/[action]")]
     public class AccountController : AbpController
     {
+
+        private readonly Microsoft.AspNetCore.Identity.UserManager<IdentityUser> _Uu;
         private readonly IdentityUserManager _userManager;
+        private readonly IdentityRoleManager _roleManager;
         private readonly IConfiguration _configuration;
         private readonly ICurrentTenant _currentTenant;
-        private readonly AspNetCoreMultiTenancyOptions _aspNetCoreMultiTenancyOptions;
-        //private readonly IIdentityModelAuthenticationService _authenticator;
+        private readonly AbpAspNetCoreMultiTenancyOptions _aspNetCoreMultiTenancyOptions;
         private readonly IProfileAppService _profileAppService;
         private readonly IIdentityRoleAppService _roleAppService;
         private readonly IIdentityUserAppService _userAppService;
@@ -97,9 +112,10 @@ namespace Base.Controllers
 
 
         public AccountController(IdentityUserManager userManager,
-            IConfigurationAccessor configurationAccessor,
+            IConfiguration configuration,
             ICurrentTenant currentTenant,
-            IOptions<AspNetCoreMultiTenancyOptions> options,
+            IdentityRoleManager roleManager,
+            IOptions<AbpAspNetCoreMultiTenancyOptions> options,
             IProfileAppService profileAppService,
             IRepository<IdentityUser> identityUser,
             IIdentityRoleAppService roleAppService,
@@ -108,32 +124,33 @@ namespace Base.Controllers
             IAbpAuthorizationService authorizationService,
             IRepository<PermissionGrant> permissionGrant,
             IPermissionDefinitionManager permissionDefinitionManager,
-            IRepository<IdentityRole> identityRole
+            IRepository<IdentityRole> identityRole,
+           Microsoft.AspNetCore.Identity.UserManager<IdentityUser> Uu
             )
-        { 
+        {
             _userManager = userManager;
+            _Uu = Uu;
             _currentTenant = currentTenant;
             _aspNetCoreMultiTenancyOptions = options.Value;
-            _configuration = configurationAccessor.Configuration;
+            _configuration = configuration;
             _profileAppService = profileAppService;
             _roleAppService = roleAppService;
             _userAppService = userAppService;
             _abpAuthorizationPolicyProvider = abpAuthorizationPolicyProvider;
             _authorizationService = authorizationService;
             _permissionDefinitionManager = permissionDefinitionManager;
-            //_authenticator = authenticator;
             _permissionGrant = permissionGrant;
             _identityUser = identityUser;
             _identityRole = identityRole;
 
-            
+            _roleManager = roleManager;
         }
 
 
         [HttpGet("permission/{Id:guid}")]
-        public async Task<IEnumerable<string>> getUserGrantPermission([FromRoute]string Id)=>
-            //获取当前user权限
-             _permissionGrant.Where(res => res.ProviderName == "User"&&res.ProviderKey == Id).ToList().Select(res=>res.Name);
+        public async Task<IEnumerable<string>> getUserGrantPermission([FromRoute]string Id) =>
+             //获取当前user权限
+             _permissionGrant.Where(res => res.ProviderName == "User" && res.ProviderKey == Id).ToList().Select(res => res.Name);
 
 
         [UnitOfWork]
@@ -146,11 +163,11 @@ namespace Base.Controllers
             //添加当前用户权限
             await addUserPermission(req.grantPermission, uId);
             //添加当前角色
-            await _userAppService.UpdateRolesAsync(req.Id, new IdentityUserUpdateRolesDto() { RoleNames = req.grantRoles});
+            await _userAppService.UpdateRolesAsync(req.Id, new IdentityUserUpdateRolesDto() { RoleNames = req.grantRoles });
         }
 
 
-        private async Task addUserPermission(IEnumerable<string> req,string uId)
+        private async Task addUserPermission(IEnumerable<string> req, string uId)
         {
             req.ToList().ForEach(async res =>
             {
@@ -158,23 +175,38 @@ namespace Base.Controllers
             });
         }
 
+        /// <summary>
+        /// 创建用户
+        /// </summary>
+        /// <param name="req"></param>
+        /// <returns></returns>
+        [UnitOfWork]
+        [HttpPost("createUser")]
+        public async Task<bool> CreateUser([FromBody]UpdateOrCreateUserDto req)
+        {
+            var dto = await _userAppService.CreateAsync(new IdentityUserCreateDto()
+            {
+                Email = req.Email,
+                UserName = req.UserName,
+                RoleNames = req.Roles,
+                Password = "1q2w3E*",
+                PhoneNumber = req.PhoneNumber
+            });
+
+            var user = await _identityUser.FirstOrDefaultAsync(x => x.Id == dto.Id);
 
 
+            await UserManagerExtensions.ChangePasswordAsync1(_Uu, user, req.Password);
 
 
+            await _permissionGrant.DeleteAsync(r => r.ProviderName == "user" && r.ProviderKey == user.Id.ToString());
+            foreach (var item in req.Permissions)
+            {
+                await _permissionGrant.InsertAsync(new PermissionGrant(Guid.NewGuid(), item, "User", user.Id.ToString()));
+            }
 
-
-
-
-
-
-
-
-
-
-
-
-
+            return true;
+        }
 
 
 
@@ -210,61 +242,60 @@ namespace Base.Controllers
             };
         }
 
+        /// <summary>
+        /// 修改用户信息，角色，用户权限
+        /// </summary>
+        /// <param name="req"></param>
+        /// <returns></returns>
+        [UnitOfWork]
+        [HttpPost("updateUser")]
+        public async Task<bool> UpdateUser([FromBody]UpdateOrCreateUserDto req)
+        {
+            //update password
+            // await _userManager.AddPasswordAsync(await _userManager.GetByIdAsync(req.Id), req.Password);
+
+            //update info
+            var user = await _identityUser.FirstOrDefaultAsync(x => x.Id == req.Id);
+
+            await _userManager.SetUserNameAsync(user, req.UserName);
+
+            await _userManager.SetEmailAsync(user, req.Email);
+
+            await _userManager.SetPhoneNumberAsync(user, req.PhoneNumber);
+
+            await _userManager.SetRolesAsync(user, req.Roles);
+            if (!req.Password.Contains("AQAAAAEAACcQAAAAE"))
+                await UserManagerExtensions.ChangePasswordAsync1(_Uu, user, req.Password);
+
+            //update user permission
+
+            await _permissionGrant.DeleteAsync(r => r.ProviderName == "user" && r.ProviderKey == req.Id.ToString());
+            foreach (var item in req.Permissions)
+            {
+                await _permissionGrant.InsertAsync(new PermissionGrant(Guid.NewGuid(), item, "User", req.Id.ToString()));
+            }
+
+            return true;
+        }
+
+
         [UnitOfWork]
         [HttpPost]
         public async Task UpdateRoleGrantPermission([FromBody]RolePerssionReq req)
         {
             //get当前角色
-            IdentityRole role = await _identityRole.FirstOrDefaultAsync(res=>res.Id == req.Id);
+            IdentityRole role = await _identityRole.FirstOrDefaultAsync(res => res.Id == req.Id);
+            //await _roleManager.SetRoleNameAsync(role, req.Name);
             //清楚当前用户所有权限
             await _permissionGrant.DeleteAsync(r => r.ProviderKey == role.Name);
             //加入权限
             req.grantPermission.ForEach(async res =>
             {
-                await _permissionGrant.InsertAsync(new PermissionGrant(Guid.NewGuid(),res, "Role",role.Name));
+                await _permissionGrant.InsertAsync(new PermissionGrant(Guid.NewGuid(), res, "Role", role.Name));
             });
+            await UnitOfWorkManager.Current.SaveChangesAsync();
         }
 
-        /// <summary>
-        /// DiscoveryClient方法提示在下一个版本被弃用，scope传递offline_access，可得到refresh_token值
-        /// </summary>
-        /// <param name="login"></param>
-        /// <returns></returns>
-        [HttpPost]
-        public async Task<IActionResult> Token(UserLoginInfo login)
-        {
-            var dico = await DiscoveryClient.GetAsync(_configuration["AuthServer:Authority"]);
-            if (dico.IsError)
-            {
-                Console.WriteLine(dico.Error);
-                return Json(new { code = 0, data = dico.Error });
-            }
-
-            await ReplaceEmailToUsernameOfInputIfNeeds(login);
-
-            var tokenClient = new TokenClient(dico.TokenEndpoint, _configuration["AuthServer:ClientId"], _configuration["AuthServer:ClientSecret"]);
-            TokenResponse tokenresp = await tokenClient.RequestResourceOwnerPasswordAsync(
-                login.UserNameOrEmailAddress,
-                login.Password,
-                "Base",
-                extra: new Dictionary<string, string>
-                {
-                    {_aspNetCoreMultiTenancyOptions.TenantKey,login.TenanId?.ToString()}
-                }
-                );
-            if (tokenresp.IsError)
-            {
-                Console.WriteLine(tokenresp.Error);
-                return Json(new
-                {
-                    code = 0,
-                    data = tokenresp.ErrorDescription,
-                    message = tokenresp.Error
-                });
-            }
-
-            return Json(new { code = 10000, data = tokenresp.Json });
-        }
 
         protected virtual async Task ReplaceEmailToUsernameOfInputIfNeeds(UserLoginInfo login)
         {
@@ -293,30 +324,47 @@ namespace Base.Controllers
             login.UserNameOrEmailAddress = userByEmail.UserName;
         }
 
+       
         /// <summary>
-        /// 官方支持获取AccessToken的写法，传递offline_access也得不到refresh_token,除了改类库源码GetAccessTokenAsync，直接返回tokenResponse
+        /// scope传递offline_access，可得到refresh_token值
         /// </summary>
         /// <param name="login"></param>
         /// <returns></returns>
-        //public async Task<IActionResult> GetAccessToken(UserLoginInfo login)
-        //{
-        //    await ReplaceEmailToUsernameOfInputIfNeeds(login);
+        [HttpPost]
+        public async Task<IActionResult> Token(UserLoginInfo login)
+        {
+            var client = new HttpClient();
+            var disco = await client.GetDiscoveryDocumentAsync(_configuration["AuthServer:Authority"]);
+            if (disco.IsError)
+            {
+                Console.WriteLine(disco.Error);
+                return Json(new { code = 0, data = disco.Error });
+            }
+            // request token
+            var tokenResponse = await client.RequestPasswordTokenAsync(new PasswordTokenRequest
+            {
+                Address = disco.TokenEndpoint,
+                ClientId = _configuration["AuthServer:ClientId"],
+                ClientSecret = _configuration["AuthServer:ClientSecret"],
+                GrantType = OidcConstants.GrantTypes.Password,
+                UserName = login.UserNameOrEmailAddress,
+                Password = login.Password,
+                Scope = "Base"
+            });
+            if (tokenResponse.IsError)
+            {
+                Console.WriteLine(tokenResponse.Error);
+                return Json(new
+                {
+                    code = 0,
+                    data = tokenResponse.ErrorDescription,
+                    message = tokenResponse.Error
+                });
+            }
+            return Json(new { code = 1, data = tokenResponse.Json });
+        }
 
-        //    var config = new IdentityClientConfiguration
-        //    {
-        //        Authority = _configuration["AuthServer:Authority"],
-        //        ClientId = _configuration["AuthServer:ClientId"],
-        //        ClientSecret = _configuration["AuthServer:ClientSecret"],
-        //        GrantType = OidcConstants.GrantTypes.Password,
-        //        UserName = login.UserNameOrEmailAddress,
-        //        UserPassword = login.Password,
-        //        Scope = "Pay"
-        //    };
 
-        //    string token = await _authenticator.GetAccessTokenAsync(config);
-
-        //    return Json(new { code = 1, data = token });
-        //}
         [HttpPost]
         public async Task<IActionResult> Info()
         {
